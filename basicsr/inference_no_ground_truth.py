@@ -4,31 +4,78 @@ import torch
 import torchvision.transforms as transforms
 import torch.nn.functional as F
 import cv2
-from scipy.ndimage import gaussian_filter
-import math
-from statistics import mean
 from PIL import Image
-
 import os
 import glob
 import sys
 from pathlib import Path
 from tqdm import tqdm
 import time
+import warnings
+warnings.filterwarnings("ignore")
+from torch.cuda.amp import autocast
 
 sys.path.append(str(Path(__file__).parents[1]))
 from utils import tensor2img
-
 sys.path.append(str(Path(__file__).parents[3]))
 from basicsr.utils.options import parse
 from importlib import import_module
+placeholder_dp = "noise"
+
+class Denoising(torch.utils.data.Dataset):
+    def __init__(self, data_path, video,
+                 noise_std,  
+                 sample=True):
+        # sample: if True, new data is created (since noise is random).
+        super().__init__()
+        self.data_path = data_path
+
+        self.files =  sorted(glob.glob(data_path + "/*.*"))
+        self.len = self.bound = len(self.files)
+        self.current_frame = 0
+        print(f"> # of Frames in {video}: {len(self.files)}")
+        self.transform = transforms.Compose([transforms.ToTensor()])
+
+        Img = Image.open(self.files[0])
+        Img = np.array(Img)
+        H, W, C = Img.shape
+
+        os.makedirs(os.path.join(f"{placeholder_dp}/{video}_{int((noise_std)*255)}"), exist_ok=True)
+        self.noisy_folder = os.path.join(f"{placeholder_dp}/{video}_{int((noise_std)*255)}")
+
+        if sample:
+            for i in range(self.len):
+                Img = Image.open(self.files[i])
+                Img = self.transform(Img)
+                self.C, self.H, self.W = Img.shape
+                std1 = noise_std
+                noise = torch.empty_like(Img).normal_(mean=0, std=std1) #.cuda().half()
+                Img = Img + noise
+                
+                np.save(os.path.join(self.noisy_folder, os.path.basename(self.files[i])[:-3]+"npy"), Img)
+        
+        self.noisy_files = sorted(glob.glob(os.path.join(self.noisy_folder, "*.npy")))
+
+    def __len__(self):
+        return self.len
+
+    def __getitem__(self, index):
+        Img = Image.open(self.files[index])
+        noisy_Img = np.load(self.noisy_files[index])
+
+
+        img_gt = np.array(Img)
+        img_gt = self.transform(img_gt)
+        img_in = torch.from_numpy(noisy_Img.copy())
+        file_name = os.path.basename(self.noisy_files[index])
+        return (file_name,  img_in.type(torch.FloatTensor))
 
 
 class VideoLoader(torch.utils.data.Dataset):
     def __init__(self, data_path, video):
         super().__init__()
         self.data_path = data_path
-        self.in_files = sorted(glob.glob(data_path+ "/*.*"))
+        self.in_files = sorted(glob.glob(data_path + "/*.*"))
         self.len = len(self.in_files)
         print(f"> # of Frames in {video}: {len(self.in_files)}")
         self.transform = transforms.Compose([transforms.ToTensor()])
@@ -44,183 +91,96 @@ class VideoLoader(torch.utils.data.Dataset):
     def __getitem__(self, index):
         img_in = Image.open(self.in_files[index])
         img_in = np.array(img_in)
-        
-
-        return (None, 
-                self.transform(np.array(img_in)).type(torch.FloatTensor))
+        file_name = os.path.basename(self.in_files[index])  # Extract the file name
+        return (file_name, self.transform(np.array(img_in)).float())
 
 
-def run_inference_patched(img_lq_prev,
-                          img_lq_curr,
-                          model, device,
-                          tile,
-                          tile_overlap,
-                          prev_patch_dict_k=None, 
-                          prev_patch_dict_v=None,
-                          img_multiple_of = 8,
-                          scale=1,
-                          model_type='t0'):
-    
-    height, width = img_lq_curr.shape[2], img_lq_curr.shape[3]
-    
-    H,W = ((height+img_multiple_of)//img_multiple_of)*img_multiple_of, ((width+img_multiple_of)//img_multiple_of)*img_multiple_of
-    padh = H-height if height%img_multiple_of!=0 else 0
-    padw = W-width if width%img_multiple_of!=0 else 0
+def run_inference_full_image(prev_frame, curr_frame, model, device, chunk_size=1200, model_type="t1"):
+    """
+    Processes the image in vertical chunks to avoid memory issues and handles SR specifically.
+    """
+    # Handle SR-specific downscaling
+    if model_type == "SR":
+        prev_frame = F.interpolate(prev_frame.unsqueeze(0), scale_factor=0.25, mode="bicubic").squeeze(0)
+        curr_frame = F.interpolate(curr_frame.unsqueeze(0), scale_factor=0.25, mode="bicubic").squeeze(0)
 
-    img_lq_curr = torch.nn.functional.pad(img_lq_curr, (0, padw, 0, padh), 'reflect')
-    img_lq_prev = torch.nn.functional.pad(img_lq_prev, (0, padw, 0, padh), 'reflect')
-        
-    # test the image tile by tile
-    b, c, h, w = img_lq_curr.shape
-    # if model_type == "SR":
-    #     h,w = h*4,w*4
+    # Ensure frames are 4D: (batch_size=1, channels, height, width)
+    if prev_frame.dim() == 3:
+        prev_frame = prev_frame.unsqueeze(0)
+    if curr_frame.dim() == 3:
+        curr_frame = curr_frame.unsqueeze(0)
 
-    tile = min(tile, h, w)
-    assert tile % 8 == 0, "tile size should be multiple of 8"
-    tile_overlap = tile_overlap
+    # Concatenate frames along the channel dimension
+    x = torch.cat((prev_frame, curr_frame), dim=1).to(device)  # Shape: (1, 2C, H, W)
 
-    stride = tile - tile_overlap
-    h_idx_list = list(range(0, h-tile, stride)) + [h-tile]
-    w_idx_list = list(range(0, w-tile, stride)) + [w-tile]
-    E = torch.zeros(b, c, h, w).type_as(img_lq_curr)
-    W = torch.zeros_like(E)
+    # Reshape into (B, T=2, C, H, W)
+    T = 2
+    C = x.shape[1] // T
+    x_reshaped = x.view(x.shape[0], T, C, x.shape[2], x.shape[3])
 
-    print(f"E: {E.shape}")
-    print(f"W: {W.shape}")
+    b, t, c, h, w = x_reshaped.shape
+    output = torch.zeros(b, c, h * (4 if model_type == "SR" else 1), w * (4 if model_type == "SR" else 1), device=device)
 
-    patch_dict_k = {}
-    patch_dict_v = {}
-    for h_idx in h_idx_list:
-        for w_idx in w_idx_list:
+    # Process in vertical chunks
+    for start in range(0, h, chunk_size):
+        end = min(start + chunk_size, h)
+        chunk = x_reshaped[:, :, :, start:end, :]
 
-            in_patch_curr = img_lq_curr[..., h_idx:h_idx+tile, w_idx:w_idx+tile]
-            in_patch_prev = img_lq_prev[..., h_idx:h_idx+tile, w_idx:w_idx+tile]
+        with torch.no_grad(), autocast():
+            out_chunk, _, _ = model(chunk.float(), None, None)
 
-            # prepare for SR following EAVSR.
-            if model_type == "SR":
-                in_patch_prev = torch.nn.functional.interpolate(in_patch_prev, 
-                                                                    scale_factor=1/4,
-                                                                    mode="bicubic")
-                in_patch_curr = torch.nn.functional.interpolate(in_patch_curr, 
-                                                                    scale_factor=1/4, 
-                                                                    mode="bicubic")
+        if model_type == "SR":
+            output[:, :, start * 4:end * 4, :] = torch.clamp(out_chunk, 0, 1)
+        else:
+            output[:, :, start:end, :] = torch.clamp(out_chunk, 0, 1)
 
-            
-            x = torch.concat((in_patch_prev.unsqueeze(0), 
-                              in_patch_curr.unsqueeze(0)), dim=1)
-            x = x.to(device)
+    return output.squeeze(0)  # Remove batch dimension
 
-            if prev_patch_dict_k is not None and prev_patch_dict_v is not None:
-                old_k_cache = [x.to(device) if x is not None else None for x in prev_patch_dict_k[f"{h_idx}-{w_idx}"]]
-                old_v_cache = [x.to(device) if x is not None else None for x in prev_patch_dict_v[f"{h_idx}-{w_idx}"]]
-            else:
-                old_k_cache = None
-                old_v_cache = None
 
-            out_patch, k_c, v_c = model(x.float(),
-                                        old_k_cache,
-                                        old_v_cache)
-            patch_dict_k[f"{h_idx}-{w_idx}"] = [x.detach().cpu() if x is not None else None for x in k_c]
-            patch_dict_v[f"{h_idx}-{w_idx}"] = [x.detach().cpu() if x is not None else None for x in v_c]
-            out_patch = out_patch.detach().cpu()
-            out_patch_mask = torch.ones_like(out_patch)
 
-            E[..., h_idx:(h_idx+tile), w_idx:(w_idx+tile)].add_(out_patch)
-            W[..., h_idx:(h_idx+tile), w_idx:(w_idx+tile)].add_(out_patch_mask)
-    
-    restored = E.div_(W)
-    restored = torch.clamp(restored, 0, 1)
-    return restored, patch_dict_k, patch_dict_v
 
 def load_model(path, model):
-    device = torch.device("cpu")
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cuda"
     model.load_state_dict(torch.load(path)['params'])
     model = model.to(device)
     model.eval()
     print(f"> Loaded Model.")
     return model, device
 
-def flatten(xss):
-    return [x for xs in xss for x in xs]
 
-def run_inference(video_name, test_loader, 
-                  model, device,
-                  model_name,
-                  save_img, do_patched, 
-                  image_out_path, tile, 
-                  tile_overlap,
-                  model_type):
-    
+def run_inference(test_loader, model, device, model_type, save_img, image_out_path, chunk_size):
     previous_frame = None
 
-    k_cache, v_cache = None, None
+    # Ensure the base path for saving images is created
+    base_path = image_out_path
+    os.makedirs(base_path, exist_ok=True)
+
     for ix in range(len(test_loader.dataset)):
-        print(ix)
-        current_frame = test_loader.dataset[ix][1]
+        file_name, current_frame = test_loader.dataset[ix]
+        print(file_name)
 
+        current_frame = current_frame.to(device)
         if previous_frame is None:
-            previous_frame = current_frame
-            
-        c, h, w = current_frame.shape
-        if do_patched:
-            # do inference in patches, and concatenate before computing PSNR/SSIM.
-            x2, k_cache, v_cache = run_inference_patched(
-                                        previous_frame.unsqueeze(0),
-                                        current_frame.unsqueeze(0),
-                                        model, device, tile=tile, 
-                                        tile_overlap=tile_overlap,
-                                        prev_patch_dict_k=k_cache, 
-                                        prev_patch_dict_v=v_cache,
-                                        model_type=model_type)
-        else:
-            # superresolution
-            if model_type == "SR":
-                previous_frame = torch.nn.functional.interpolate(previous_frame, 
-                                                                    scale_factor=1/4,
-                                                                    mode="bicubic")
-                current_frame = torch.nn.functional.interpolate(current_frame, 
-                                                                    scale_factor=1/4, 
-                                                                    mode="bicubic")
-            # do inference on whole frame if the memory can be fit.
-            x = torch.concat((previous_frame.unsqueeze(0), 
-                            current_frame.unsqueeze(0)), dim=0).to(device)
-            x2, k_cache, v_cache = model(x.unsqueeze(0), k_cache, v_cache)
-            x2 = torch.clamp(x2, 0, 1)
+            previous_frame = current_frame.clone()
 
-        x2 = x2.squeeze(0)
-        x2 = x2[:, :h, :w]
-        
+        # Run full-image inference in chunks (no tiling)
+        out_frame = run_inference_full_image(previous_frame, current_frame, model, device, chunk_size=chunk_size, model_type=model_type)
+        out_frame = out_frame[:, :current_frame.shape[1], :current_frame.shape[2]]  # Just ensure size matches original
+
         if save_img:
-            fig, axs = plt.subplots(1, 2, figsize=(10,10))
-            
-            axs[0].imshow(current_frame.permute(1, 2, 0).detach().cpu().numpy())
-            axs[1].imshow(x2.permute(1, 2, 0).detach().cpu().numpy())
-            
-            axs[0].set_title('Input')
-            axs[1].set_title('Pred')
+            # Save the output using the original file name
+            out_np = out_frame.permute(1, 2, 0).detach().cpu().numpy() * 255
+            out_np = out_np.astype(np.uint8)
+            out_bgr = cv2.cvtColor(out_np, cv2.COLOR_RGB2BGR)
+            filename_no_ext, _ = os.path.splitext(file_name)  
+            file_name_pred = os.path.join(base_path, filename_no_ext + '.png')
+            cv2.imwrite(file_name_pred, out_bgr)
 
-            plt.tight_layout()
 
-            # Ensure the directory for the model exists
-            base_path = image_out_path
-            base_path = os.path.join(base_path, model_name)
-            os.makedirs(base_path, exist_ok=True)
-            base_path = os.path.join(base_path, video_name)
-            os.makedirs(base_path, exist_ok=True)
-
-            file_name = f"Frame_{ix+1}.png"  
-            file_name_inp = os.path.join(base_path, f"Frame_{ix+1}_Input.png") 
-            file_name_pred = os.path.join(base_path, f"Frame_{ix+1}_Pred.png")   
-            
-            save_path = os.path.join(base_path, file_name)
-            plt.savefig(save_path, bbox_inches='tight')
-            cv2.imwrite(file_name_pred, cv2.cvtColor((x2.permute(1, 2, 0).detach().cpu().numpy()*255).astype(np.uint8), cv2.COLOR_BGR2RGB))
-            cv2.imwrite(file_name_inp, cv2.cvtColor((current_frame.permute(1, 2, 0).detach().cpu().numpy()*255).astype(np.uint8), cv2.COLOR_BGR2RGB))
-
-        previous_frame = current_frame
+        previous_frame = current_frame.clone()
 
     return None, None
+
 
 def create_video_model(opt, model_type="t0"):
     if model_type == "t0":
@@ -230,62 +190,48 @@ def create_video_model(opt, model_type="t0"):
         module = import_module('basicsr.models.archs.turtle_t1_arch')
         model = module.make_model(opt)
     elif model_type == "SR":
-        module = import_module('basicsr.models.archs.turtle_super_t1_arch')
+        module = import_module('basicsr.models.archs.turtlesuper_t1_arch')
         model = module.make_model(opt)
     else:
         print("Model type not defined")
         exit()
     return model
 
+
 def main(model_path,
-         model_name,
          data_dir,
          config_file,
-         tile,
-         tile_overlap,
          save_image,
          model_type,
-         do_pacthes,
          image_out_path,
-         noise_sigma=50.0/255.0,
+         chunk_size=192 ,
+         task_name = "deblure",
+        noise_sigma=5.0/255.0,
          sample=True,
          y_channel_PSNR=False):
 
     print(f"model_type: {model_type}")
-    print(f"do_patches: {do_pacthes}")
-    print(f"tile: {tile}")
-    print(f"tile_overlap: {tile_overlap}")
-    print(F"sample: {sample}")
-    
+    print(f"Using chunk processing with chunk_size: {chunk_size}")
 
     opt = parse(config_file, is_train=True)
     model = create_video_model(opt, model_type)
 
     model, device = load_model(model_path, model)
-    videos = sorted(glob.glob(os.path.join(data_dir, '*')))
-
-    for video in videos:
-        video_name = video.split('/')[-1]
-        if video_name:
-
-            data = VideoLoader(data_dir,
-                                None)
-                
-            test_loader = torch.utils.data.DataLoader(data,
-                                                    batch_size=1, 
-                                                    num_workers=1, 
-                                                    shuffle=False)
-            _, _ = run_inference(video_name,
-                                test_loader,
-                                model,
-                                device,
-                                model_name,
-                                save_img=save_image,
-                                do_patched=do_pacthes,
-                                image_out_path=image_out_path,
-                                tile=tile,
-                                tile_overlap=tile_overlap,
-                                model_type=model_type)
+    if task_name == "denoise":
+        data = Denoising(data_dir, None,noise_sigma)
+    else:
+        data = VideoLoader(data_dir, None)
+    test_loader = torch.utils.data.DataLoader(data,
+                                                batch_size=1, 
+                                                num_workers=1, 
+                                                shuffle=False)
+    _, _ = run_inference(                            test_loader,
+                            model,
+                            device,
+                            model_type,
+                            save_img=save_image,
+                            image_out_path=image_out_path,
+                            chunk_size=chunk_size)
 
     return 0, 0
 
@@ -293,149 +239,22 @@ def main(model_path,
 if __name__ == "__main__":
     st = time.time()
 
-    #----------------------------------------------------------------------------------------------------------
-    #Super-Resolution
+    # Example configuration:
+    config = "options/Turtle_Deblur_Gopro.yml"
+    model_path = "experiments/supervideos73/models/net_g_70000.pth" 
+    data_dir = "demo_73"
+    image_out_path = "result/demo_73"
+    model_type = "t1"
+    save_image = True
+    chunk_size = 2000  # Adjust based on VRAM usage
 
-    """
-    if the input video is already in lower spatial resolution than your desired output resolution, 
-    this downsampling step should be commented in the inference code(lines 100 & 178).
-    """
-    config = "/options/Turtle_SR_MVSR.yml"
-    model_path = "/trained_models/SuperResolution.pth"
-    model_name = "SR_test"
-    print(model_name)
     _, _ = main(model_path=model_path,
-                model_name=model_name, 
                 config_file=config,
-
-                data_dir="/data_dir/", #Path to the desired video frames folder
-
-                model_type="SR",
-
-                save_image=True,
-                image_out_path="/outputs/",
-
-                do_pacthes=True,
-                tile=320,
-                tile_overlap=128)
+                data_dir=data_dir,
+                model_type=model_type,
+                save_image=save_image,
+                image_out_path=image_out_path, 
+                chunk_size=chunk_size)
 
     end = time.time()
     print(f"Completed in {end-st}s")
-    
-    # #----------------------------------------------------------------------------------------------------------
-    # #desnowing
-    # config = "/options/Turtle_Desnow.yml"
-    # model_path = "/trained_models/Desnow.pth"
-    # model_name = "Turtle_desnow_simple_full"
-    # print(model_name)
-    # _, _ = main(model_path=model_path,
-    #             model_name=model_name, 
-    #             config_file=config,
-
-    #             data_dir="/data_dir/", #Path to the desired video frames folder
-
-    #             model_type="t0",
-
-    #             save_image=True,
-    #             image_out_path="/outputs/",
-
-    #             do_pacthes=True,
-    #             tile=320,
-    #             tile_overlap=128)
-
-    # end = time.time()
-    # print(f"Completed in {end-st}s")
-
-
-    # # ----------------------------------------------------------------------------------------------------------
-    # #Deraining, night
-    # config = "/options/Turtle_Derain.yml"
-    # model_path = "/trained_models/NightRain.pth"
-    # model_name = "Turtle_Derain_simple_320_128_30"
-    # print(model_name)
-    # _, _ = main(model_path=model_path,
-    #             model_name=model_name, 
-    #             config_file=config,
-    #             data_dir="/data_dir/", #Path to the desired video frames folder
-    #             model_type="t0", #simple_parallel(For big patches), simple
-
-    #             save_image=True,
-    #             image_out_path="/outputs/",
-
-    #             do_pacthes=True,
-    #             tile=320,
-    #             tile_overlap=128)
-
-    # end = time.time()
-    # print(f"Completed in {end-st}s")
-
-    # ----------------------------------------------------------------------------------------------------------
-    # Deraining, raindrop
-
-    # config = "/options/Turtle_Derain_VRDS.yml"
-    # model_path = "/trained_models/RainDrop.pth"
-    # model_name = "Turtle_RainDrop_simple_320_128"
-    # print(model_name)
-    # _, _ = main(model_path=model_path,
-    #             model_name=model_name, 
-    #             config_file=config,
-    #             data_dir="/data_dir/", #Path to the desired video frames folder
-    #             model_type="t1", #simple_parallel(For big patches), simple
-
-    #             save_image=True,
-    #             image_out_path="/home/amir/codes/temp/",
-
-    #             do_pacthes=True,
-    #             tile=320,
-    #             tile_overlap=128)
-
-    # end = time.time()
-    # print(f"Completed in {end-st}s")
-
-    # #----------------------------------------------------------------------------------------------------------
-    # # Deblurring, Gopro
-    # config = "/options/Turtle_Deblur_Gopro.yml"
-    # model_path = "/trained_models/net_g_200000.pth"
-    # model_name = "Turtle_GoPro_simple_320_128_200k_kamran_no_pos"
-    # print(model_name)
-    # _, _ = main(model_path=model_path,
-    #             model_name=model_name, 
-    #             config_file=config,
-
-    #             data_dir="/data_dir/", #Path to the desired video frames folder
-    #             model_type="t1", #simple_parallel(For big patches), simple
-
-    #             save_image=False,
-    #             image_out_path="path_to_save_images",
-
-    #             do_pacthes=True,
-    #             tile=320,
-    #             tile_overlap=128)
-
-    # end = time.time()
-    # print(f"Completed in {end-st}s")
-
-
-    # #----------------------------------------------------------------------------------------------------------
-    # # Deblur, BSD
-    # #90Kmodel
-    # config = "/options/Turtle_Derain_VRDS.yml"
-    # model_path = "/trained_models/BSD.pth"
-    # model_name = "Turtle_BSD082_simple_320_128"
-    # print(model_name)
-    # _, _ = main(model_path=model_path,
-    #             model_name=model_name, 
-    #             config_file=config,
-
-    #             data_dir="/data_dir/", #Path to the desired video frames folder
-    #             model_type="t0", #simple_parallel(For big patches), simple
-
-    #             save_image=True,
-    #             image_out_path="/home/amir/codes/temp/",
-
-    #             do_pacthes=True,
-    #             tile=320,
-    #             tile_overlap=128)
-
-    # end = time.time()
-    # print(f"Completed in {end-st}s")
